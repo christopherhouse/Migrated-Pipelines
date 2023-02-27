@@ -1,0 +1,111 @@
+name: Customer_Work/Cosmos_Functions_Demo
+on:
+  push:
+    branches:
+    - master
+  pull_request:
+    branches:
+    - master
+env:
+  azure-sub: AIRS
+  buildConfiguration: Release
+  cosmosAccountName: cmh-cosmos-demo-acct
+  cosmosContainerName: products
+  cosmosContainerPartitionKey: "/category"
+  cosmosDatabaseName: cmh-cosmos-demo-db
+  functionAppName: cmh-cosmos-demo
+  infrastructure-arm-template: "${{ runner.workspace }}/Infrastructure/cosmosfunctionsdemo.json"
+  location: eastus
+  ordersContainerName: orders
+  ordersPartitionKey: "/customerNumber"
+  pool: ubuntu-latest
+  resourceGroup: COSMOS-DEMO
+  skipComponentGovernanceDetection: true
+jobs:
+  Build-BuildInfrastructure:
+    name: Build Infrastructure
+    runs-on: ubuntu-latest
+    steps:
+    - name: checkout
+      uses: actions/checkout@v3.3.0
+    - name: Install Bicep tooling
+      run: "${{ github.workspace }}/infrastructure/install.sh"
+      shell: bash
+    - name: Build ARM template from Bicep
+      run: "${{ github.workspace }}/infrastructure/build.sh"
+      shell: bash
+      working-directory: "${{ github.workspace }}/infrastructure/"
+    # The following script preserves the globbing behavior of the CopyFiles task.
+    # Refer to this transformer's documentation for an alternative that will work in simple cases.
+    - name: Copy ARM templates to archive directory
+      uses: actions/github-script@v6.4.0
+      env:
+        TARGET_FOLDER: "${{ runner.temp }}/infrastructure/"
+        SOURCE_FOLDER: "${{ github.workspace }}/infrastructure"
+        CONTENTS: "**/*.json"
+      with:
+        github-token: "${{ secrets.GITHUB_TOKEN }}"
+        script: |-
+          const fs = require('fs').promises
+          const path = require('path')
+          const target = path.resolve(process.env.TARGET_FOLDER)
+          process.chdir(process.env.SOURCE_FOLDER || '.')
+          if (process.env.CLEAN_TARGET_FOLDER === 'true') await io.rmRF(target)
+          const flattenFolders = process.env.FLATTEN_FOLDERS === 'true'
+          const options = {force: process.env.OVERWRITE === 'true'}
+          const globber = await glob.create(process.env.CONTENTS || '**')
+          for await (const file of globber.globGenerator()) {
+            if ((await fs.lstat(file)).isDirectory()) continue
+            const filename = flattenFolders ? path.basename(file) : file.substring(process.cwd().length)
+            const dest = path.join(target, filename)
+            await io.mkdirP(path.dirname(dest))
+            await io.cp(file, dest, options)
+          }
+    - name: Publish infrastructure artifact
+      uses: actions/upload-artifact@v3.1.1
+      with:
+        name: Infrastructure
+        path: "${{ runner.temp }}/infrastructure/"
+    # The dotnet CLI does not accept glob patterns. Consider using a solution file to act on multiple projects at once.
+    - name: Build
+      run: dotnet build **/*.csproj -- configuration Release
+    # The dotnet CLI does not accept glob patterns. Consider using a solution file to act on multiple projects at once.
+    - name: Publish
+      run: dotnet publish **/*.csproj --configuration Release --output ${{ runner.temp }}/code/
+    - name: Publish code artifact
+      uses: actions/upload-artifact@v3.1.1
+      with:
+        name: Code
+        path: "${{ runner.temp }}/code/"
+  Deploy-Deploy:
+    needs:
+    - Build-BuildInfrastructure
+    runs-on:
+      - self-hosted
+      - "${{ env.pool }}"
+    environment:
+      name: Development
+    env:
+      cosmosConnectionString: AccountEndpoint=https://cmh-cosmos-demo-acct.documents.azure.com:443/;AccountKey=NPp4qSRKNklT0SLKVMk5NxmaqpEL3n4502h78eXx1NJ47khEVBntNz9DKH7xvgrxmi7oXYdtti2aCwl7rRatRQ==;
+    if: github.RUN_NUMBER == 1
+    steps:
+    - name: checkout
+      uses: actions/checkout@v3.3.0
+    - name: download artifact
+      uses: actions/download-artifact@v3.0.1
+#     # 'AzureResourceGroupDeployment' was not transformed because the '' action is not supported
+    - name: Deploy functions
+      uses: azure/login@v1.4.6
+      with:
+        creds: "${{ secrets.AZURE_CREDENTIALS }}"
+    # The Azure Function App does not accept glob patterns. Consider updating the package path.
+    - name: Deploy functions
+      uses: azure/functions-action@v1.4.8
+      with:
+        app-name: "${{ env.functionAppName }}"
+        package: "${{ runner.workspace }}/Code/*.zip"
+    - name: Deploy functions
+      uses: azure/appservice-settings@v1
+      with:
+        app-name: "${{ env.functionAppName }}"
+        app-settings-json: '[{"name":"cosmosDatabaseName","value":"${{ env.cosmosDatabaseName }}","slotSetting":false},{"name":"cosmosContainerName","value":"${{ env.cosmosContainerName }}","slotSetting":false},{"name":"cosmosConnectionstring","value":"${{ env.cosmosConnectionString }}","slotSetting":false}]'
